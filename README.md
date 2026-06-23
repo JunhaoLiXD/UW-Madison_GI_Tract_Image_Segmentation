@@ -168,6 +168,21 @@ The main training configuration is shown below.
 
 ---
 
+## Checkpointing and Resumable Training
+
+Kaggle GPU sessions are capped at a hard 12-hour limit. In "Save & Run All" (Commit) mode, a run that hits that wall **fails and discards all `/kaggle/working` outputs**, including any checkpoint written mid-run. To make long runs safe, the training notebook supports clean interruption and resume:
+
+- **Per-epoch `last` checkpoint.** In addition to the best checkpoint, every epoch writes `last_effnetb0_unet_c_order_fold0.pth`, which stores the model, optimizer, scheduler, and AMP scaler state plus the current epoch and best Dice. The best checkpoint is still saved only when validation Dice improves.
+- **Resume.** With `CFG.resume = True`, re-running the notebook detects an existing `last` checkpoint, restores all training state, and continues from the next epoch. The training-history CSV is also rebuilt from disk so it continues without duplicate rows.
+- **Predictive wall-clock guard.** `CFG.max_train_hours` (default `11.0`) sets a per-session time budget. After each epoch the notebook estimates the average epoch time and, if one more epoch would exceed the budget, stops cleanly with both checkpoints already saved — so the run is never killed mid-epoch by the 12-hour limit. Each Kaggle session gets a fresh budget, so a training run that needs more than 12 hours can finish across multiple sessions by simply re-running.
+
+| Parameter | Value |
+|---|---:|
+| `CFG.max_train_hours` | 11.0 |
+| `CFG.resume` | True |
+
+---
+
 ## Data Augmentation
 
 Training augmentation is applied using Albumentations:
@@ -305,6 +320,7 @@ A typical project structure is:
 │   └── gi-tract-image-segmentation-threshold-tuning.ipynb
 ├── outputs/
 │   ├── best_effnetb0_unet_c_order_fold0.pth
+│   ├── last_effnetb0_unet_c_order_fold0.pth
 │   ├── training_history_c_order_fold0.csv
 │   ├── threshold_tuning_training_style_c_order_fold0.csv
 │   ├── best_thresholds_training_style_c_order_fold0.json
