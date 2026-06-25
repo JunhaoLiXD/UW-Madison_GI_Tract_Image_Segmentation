@@ -1,0 +1,11 @@
+# Model checkpoints — too large for GitHub (B5 ~370 MB). See models/README.md.
+models/*.pth
+
+# Jupyter / Python
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

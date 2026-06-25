@@ -16,14 +16,18 @@ The project follows a complete segmentation workflow, including data parsing, RL
 
 ## Final Submission Result
 
-The final submitted version achieved the following Kaggle scores:
+Two versions were submitted to Kaggle. The EfficientNet-B5 model (with an auxiliary classification
+head) is the latest and best:
 
-| Metric | Score |
-|---|---:|
-| Public Score | 0.80577 |
-| Private Score | 0.77297 |
+| Submission | Public Score | Private Score |
+|---|---:|---:|
+| EfficientNet-B0 baseline | 0.80577 | 0.77297 |
+| **EfficientNet-B5 + aux head (best)** | **0.81244** | **0.77691** |
 
-The final inference thresholds were selected separately for each organ:
+B5 improves the leaderboard by **+0.0067 public / +0.0039 private** over the B0 baseline.
+
+The B0 baseline used the following per-organ inference thresholds (B5 was submitted with its own
+re-tuned thresholds; see the EfficientNet-B5 section below):
 
 ```python
 thresholds = {
@@ -249,21 +253,9 @@ The best validation Dice in the recorded fold-0 training run was achieved at epo
 | Small bowel validation Dice | 0.8447 |
 | Stomach validation Dice | 0.9326 |
 
-### Training and Validation Loss
-
-The following placeholder is reserved for the loss curve.
-
-<!-- Replace the path below with the actual image path after exporting the chart. -->
-
-![Training and validation loss](figures/training_validation_loss.png)
-
-### Training and Validation Dice
-
-The following placeholder is reserved for the overall Dice curve.
-
-<!-- Replace the path below with the actual image path after exporting the chart. -->
-
-![Training and validation Dice](figures/training_validation_dice.png)
+The full per-epoch loss and Dice history is saved as CSV under `results/`
+(`training_history_effnetb0_c_order_fold0.csv` for B0 and
+`training_history_effnetb5_c_order_fold0.csv` for B5).
 
 ---
 
@@ -315,22 +307,23 @@ A typical project structure is:
 ```text
 .
 ├── README.md
+├── CLAUDE.md
+├── docs/
+│   └── UW_Madison_GI_Tract_Segmentation_Technical_Documentation_EN.docx
 ├── notebooks/
-│   ├── uw-madison-gi-tract-image-segmentation-version4.ipynb
-│   └── gi-tract-image-segmentation-threshold-tuning.ipynb
-├── outputs/
-│   ├── best_effnetb0_unet_c_order_fold0.pth
-│   ├── last_effnetb0_unet_c_order_fold0.pth
-│   ├── training_history_c_order_fold0.csv
-│   ├── threshold_tuning_training_style_c_order_fold0.csv
-│   ├── best_thresholds_training_style_c_order_fold0.json
-│   └── submission.csv
-└── figures/
-    ├── training_validation_loss.png
-    └── training_validation_dice.png
+│   ├── uw-madison-gi-tract-image-segmentation.ipynb            # training
+│   ├── gi-tract-image-segmentation-threshold-tuning.ipynb      # threshold tuning
+│   └── gi-tract-image-segmentation-submission-notebook.ipynb   # inference / submission
+├── models/
+│   └── README.md   # checkpoints (*.pth) are git-ignored; see this file to obtain them
+└── results/
+    ├── training_history_effnetb0_c_order_fold0.csv
+    └── training_history_effnetb5_c_order_fold0.csv
 ```
 
-Large files such as model checkpoints and Kaggle datasets are usually not committed directly to the repository.
+Model checkpoints (`models/*.pth`) are **not committed** — they are too large for GitHub (the B5
+checkpoint is ~370 MB) and are git-ignored. See `models/README.md` for how to obtain them. Kaggle
+datasets are likewise kept out of the repository.
 
 ---
 
@@ -366,12 +359,77 @@ On Kaggle, internet access may be disabled during submission. In that case, exte
 
 ---
 
+## EfficientNet-B5 Experiment (Submitted — Best Result)
+
+After the EfficientNet-B0 baseline, a higher-capacity variant was trained to push validation Dice
+further. It is now **trained and submitted**, and it is the **best result** so far:
+**public 0.81244 / private 0.77691** (vs B0's 0.80577 / 0.77297).
+
+### Changes vs. the B0 baseline
+
+| Aspect | B0 baseline (submitted) | B5 experiment |
+|---|---|---|
+| Encoder | EfficientNet-B0 | EfficientNet-B5 |
+| Image size | 384 × 384 | 456 × 456 (B5 native) |
+| Batch | 8 | 2 × 4 grad-accum (effective 8) |
+| Aux classification head | none | enabled (per-organ presence logit) |
+| Loss | BCE + 3·Dice | BCE + 3·Dice + 0.3·BCE (presence) |
+
+The auxiliary head shares the encoder and outputs one presence logit per organ
+(`smp.Unet(aux_params=...)`); the model returns `(seg_logits, cls_logits)`. The presence targets
+are derived from the masks (a class is "present" if its mask has any positive pixel), and the
+classification BCE is added with weight `0.3`. Gradient accumulation keeps the per-step memory peak
+small so B5 at 456 fits on a 16 GB GPU while preserving an effective batch size of 8.
+
+### Results
+
+Training ran the **full 20 of 20 epochs** (finished across multiple Kaggle sessions via the
+resume/wall-clock mechanism). The cosine schedule fully annealed to its minimum (final lr =
+`eta_min` 1e-6), so the run has converged — validation Dice over the last ~7 epochs only moved within
+noise (≤0.0003), and the best score landed on the final epoch.
+
+| Metric | B0 baseline | B5 experiment |
+|---|---:|---:|
+| Best epoch | 16 (of 20, finished) | 20 (of 20, finished) |
+| Best validation Dice | 0.8832 | **0.9112** |
+| Large bowel Dice | 0.8723 | 0.9015 |
+| Small bowel Dice | 0.8447 | 0.8828 |
+| Stomach Dice | 0.9326 | 0.9494 |
+| Time per epoch | ~12 min | ~42 min |
+| **Public LB** | 0.80577 | **0.81244** |
+| **Private LB** | 0.77297 | **0.77691** |
+
+The B5 run improves validation Dice by roughly +2.8% over B0 across all three organs, with the
+largest gain on the hardest class (small bowel). The local gain carried over to the leaderboard:
+**+0.0067 public / +0.0039 private**, confirming the validation improvement was real and not
+overfit to fold 0.
+
+The full B5 epoch history is saved to `results/training_history_effnetb5_c_order_fold0.csv`; the
+B0 history (extracted from the original spreadsheet) is at
+`results/training_history_effnetb0_c_order_fold0.csv`.
+
+### How B5 was submitted
+
+The threshold-tuning and submission notebooks were **realigned to the B5 setup**
+(`efficientnet-b5`, `img_size = 456`, `use_aux_cls = True`, and a `forward_seg_logits` helper that
+builds `smp.Unet(aux_params=...)` and takes the segmentation logits from the
+`(seg_logits, cls_logits)` tuple). The threshold-tuning notebook was re-run on the B5 checkpoint to
+produce B5-specific per-class thresholds (the B0 values 0.39 / 0.59 / 0.33 are not optimal for B5),
+which the submission notebook loads via `thresholds_json_path`. This produced the submitted
+**public 0.81244 / private 0.77691** result.
+
+> Reproduction note: both notebooks read the B5 weights and thresholds from Kaggle dataset paths
+> (`checkpoint_path` / `thresholds_json_path`); point these at wherever the artifacts are uploaded.
+
+---
+
 ## Possible Future Improvements
 
 Potential improvements include:
 
 - training all 5 folds and using fold ensembling
-- testing larger encoders such as EfficientNet-B3 or EfficientNet-B5
+- training all 5 folds of the EfficientNet-B5 model and ensembling them (only fold 0 is submitted so far)
+- testing other larger encoders such as EfficientNet-B3
 - using longer 2.5D context windows
 - adding stronger post-processing for removing small false-positive masks
 - tuning thresholds using the final competition-style metric
@@ -382,4 +440,4 @@ Potential improvements include:
 
 ## Summary
 
-This project implements a complete medical image segmentation pipeline for gastrointestinal organ segmentation from abdominal MRI slices. The final solution uses a 2.5D EfficientNet-B0 U-Net model, C-order RLE mask handling, case-level grouped validation, BCE plus Dice loss, and class-specific threshold tuning. The final submitted model achieved a public score of `0.80577` and a private score of `0.77297`.
+This project implements a complete medical image segmentation pipeline for gastrointestinal organ segmentation from abdominal MRI slices. The solution uses a 2.5D EfficientNet U-Net model, C-order RLE mask handling, case-level grouped validation, BCE plus Dice loss, and class-specific threshold tuning. The EfficientNet-B0 baseline scored public `0.80577` / private `0.77297`; the larger EfficientNet-B5 model with an auxiliary classification head improved this to public `0.81244` / private `0.77691`, the best submitted result.
