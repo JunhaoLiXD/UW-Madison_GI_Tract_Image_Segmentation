@@ -8,7 +8,7 @@ This project builds a deep learning pipeline for multi-class medical image segme
 - `small_bowel`
 - `stomach`
 
-The final model predicts pixel-level probability maps for each organ, converts them into binary masks using class-specific thresholds, and encodes the masks into run-length encoding (RLE) format for Kaggle submission.
+The final model is a 2.5D **EfficientNet-B5 U-Net with an auxiliary organ-presence classification head**. It predicts pixel-level probability maps for each organ, converts them into binary masks using class-specific thresholds, and encodes the masks into run-length encoding (RLE) format for Kaggle submission. An EfficientNet-B0 U-Net (no auxiliary head) served as the baseline.
 
 The project follows a complete segmentation workflow, including data parsing, RLE mask decoding, 2.5D input construction, model training, validation, threshold tuning, and final submission generation.
 
@@ -16,26 +16,12 @@ The project follows a complete segmentation workflow, including data parsing, RL
 
 ## Final Submission Result
 
-Two versions were submitted to Kaggle. The EfficientNet-B5 model (with an auxiliary classification
-head) is the latest and best:
-
-| Submission | Public Score | Private Score |
-|---|---:|---:|
-| EfficientNet-B0 baseline | 0.80577 | 0.77297 |
-| **EfficientNet-B5 + aux head (best)** | **0.81244** | **0.77691** |
+| Submission | Validation Dice (fold 0) | Public Score | Private Score |
+|---|---:|---:|---:|
+| EfficientNet-B0 baseline | 0.8832 | 0.80577 | 0.77297 |
+| **EfficientNet-B5 + aux head (final)** | **0.9112** | **0.81244** | **0.77691** |
 
 B5 improves the leaderboard by **+0.0067 public / +0.0039 private** over the B0 baseline.
-
-The B0 baseline used the following per-organ inference thresholds (B5 was submitted with its own
-re-tuned thresholds; see the EfficientNet-B5 section below):
-
-```python
-thresholds = {
-    "large_bowel": 0.39,
-    "small_bowel": 0.59,
-    "stomach": 0.33,
-}
-```
 
 ---
 
@@ -100,7 +86,7 @@ This reduces the effect of extreme intensity values while preserving useful anat
 
 The dataset is split using `GroupKFold` with case ID as the grouping variable. This prevents images from the same patient case from appearing in both training and validation sets.
 
-The current experiment trains and validates on:
+Only fold 0 is trained and validated:
 
 ```text
 Number of folds: 5
@@ -112,72 +98,84 @@ Validation fold: fold 0
 
 ## Model Architecture
 
-The model is a U-Net segmentation network with an EfficientNet-B0 encoder.
+The final model is a U-Net with an EfficientNet-B5 encoder and an auxiliary classification head that shares the encoder.
 
 ```text
 Input:
     2.5D MRI image
-    shape = [3, 384, 384]
+    shape = [3, 456, 456]
 
 Encoder:
-    EfficientNet-B0
+    EfficientNet-B5
     pretrained on ImageNet
 
 Decoder:
-    U-Net decoder
-
-Output:
-    3-channel segmentation logits
+    U-Net decoder -> seg_logits, 3 channels
     channel 0 = large_bowel
     channel 1 = small_bowel
     channel 2 = stomach
+
+Auxiliary head (on encoder features):
+    avg pooling + dropout 0.2 -> cls_logits, 3 per-organ presence logits
+
+Output:
+    (seg_logits, cls_logits)
 ```
 
-The model is implemented with `segmentation_models_pytorch`:
+The model is implemented with `segmentation_models_pytorch`; the auxiliary head is added through `aux_params`:
 
 ```python
 model = smp.Unet(
-    encoder_name="efficientnet-b0",
+    encoder_name="efficientnet-b5",
     encoder_weights="imagenet",
     in_channels=3,
     classes=3,
     activation=None,
+    aux_params=dict(
+        pooling="avg",
+        dropout=0.2,
+        classes=3,
+        activation=None,
+    ),
 )
+
+seg_logits, cls_logits = model(x)
 ```
 
-`activation=None` means that the network outputs raw logits. Sigmoid activation is applied only during metric calculation and inference.
+`activation=None` means that both outputs are raw logits. Sigmoid activation is applied only during metric calculation and inference. The B0 baseline used the same U-Net with `encoder_name="efficientnet-b0"`, 384 × 384 input, and no `aux_params` (a single segmentation output).
 
 ---
 
 ## Training Configuration
 
-The main training configuration is shown below.
+| Parameter | EfficientNet-B5 (final) | EfficientNet-B0 (baseline) |
+|---|---|---|
+| Encoder | EfficientNet-B5 | EfficientNet-B0 |
+| Encoder weights | ImageNet | ImageNet |
+| Image size | 456 × 456 (B5 native) | 384 × 384 |
+| Input channels / output classes | 3 / 3 | 3 / 3 |
+| Batch size | 2 × 4 gradient accumulation (effective 8) | 8 |
+| Aux classification head | Enabled (per-organ presence) | None |
+| Loss | BCE + 3·Dice + 0.3·BCE (presence) | BCE + 3·Dice |
+| Epochs | 20 | 20 |
+| Optimizer | AdamW | AdamW |
+| Learning rate | 1e-4 | 1e-4 |
+| Weight decay | 1e-2 | 1e-2 |
+| Scheduler | CosineAnnealingLR | CosineAnnealingLR |
+| Minimum learning rate | 1e-6 | 1e-6 |
+| AMP mixed precision | Enabled when CUDA is available | Enabled when CUDA is available |
+| Fold used | Fold 0 | Fold 0 |
 
-| Parameter | Value |
-|---|---:|
-| Image size | 384 × 384 |
-| Input channels | 3 |
-| Output classes | 3 |
-| Encoder | EfficientNet-B0 |
-| Encoder weights | ImageNet |
-| Batch size | 8 |
-| Epochs | 20 |
-| Optimizer | AdamW |
-| Learning rate | 1e-4 |
-| Weight decay | 1e-2 |
-| Scheduler | CosineAnnealingLR |
-| Minimum learning rate | 1e-6 |
-| AMP mixed precision | Enabled when CUDA is available |
-| Fold used | Fold 0 |
+Gradient accumulation keeps the per-step memory peak small (it is set by the per-step batch of 2), so B5 at 456 × 456 fits on a 16 GB GPU while preserving an effective batch size of 8.
 
 ---
 
 ## Checkpointing and Resumable Training
 
-Kaggle GPU sessions are capped at a hard 12-hour limit. In "Save & Run All" (Commit) mode, a run that hits that wall **fails and discards all `/kaggle/working` outputs**, including any checkpoint written mid-run. To make long runs safe, the training notebook supports clean interruption and resume:
+Kaggle GPU sessions are capped at a hard 12-hour limit. In "Save & Run All" (Commit) mode, a run that hits that wall **fails and discards all `/kaggle/working` outputs**, including any checkpoint written mid-run. B5 takes ~42 min per epoch, so its 20-epoch run was finished across multiple Kaggle sessions using the following mechanism:
 
-- **Per-epoch `last` checkpoint.** In addition to the best checkpoint, every epoch writes `last_effnetb0_unet_c_order_fold0.pth`, which stores the model, optimizer, scheduler, and AMP scaler state plus the current epoch and best Dice. The best checkpoint is still saved only when validation Dice improves.
-- **Resume.** With `CFG.resume = True`, re-running the notebook detects an existing `last` checkpoint, restores all training state, and continues from the next epoch. The training-history CSV is also rebuilt from disk so it continues without duplicate rows.
+- **Per-epoch `last` checkpoint.** In addition to the best checkpoint `best_<model_tag>_unet_c_order_fold0.pth`, every epoch writes `last_<model_tag>_unet_c_order_fold0.pth` (`<model_tag>` is derived from the encoder, e.g. `last_effnetb5_unet_c_order_fold0.pth` for B5). It stores the model, optimizer, scheduler, and AMP scaler state plus the current epoch and best Dice. The best checkpoint is still saved only when validation Dice improves.
+- **Resume.** With `CFG.resume = True`, re-running the notebook detects an existing `last` checkpoint, restores all training state, and continues from the next epoch. The training-history CSV is also rebuilt from disk so it continues without duplicate rows. The notebook includes a restore cell that copies the previous session's `last` / `best` checkpoints and history CSV from `/kaggle/input` into `/kaggle/working`.
 - **Predictive wall-clock guard.** `CFG.max_train_hours` (default `11.0`) sets a per-session time budget. After each epoch the notebook estimates the average epoch time and, if one more epoch would exceed the budget, stops cleanly with both checkpoints already saved — so the run is never killed mid-epoch by the 12-hour limit. Each Kaggle session gets a fresh budget, so a training run that needs more than 12 hours can finish across multiple sessions by simply re-running.
 
 | Parameter | Value |
@@ -192,7 +190,7 @@ Kaggle GPU sessions are capped at a hard 12-hour limit. In "Save & Run All" (Com
 Training augmentation is applied using Albumentations:
 
 ```text
-Resize to 384 × 384
+Resize to 456 × 456 (384 × 384 for the B0 baseline)
 Horizontal flip with p = 0.5
 Affine transform with small translation, scale, and rotation
 Random brightness and contrast adjustment
@@ -205,13 +203,13 @@ Validation uses only resizing and tensor conversion. No random augmentation is a
 
 ## Loss Function
 
-The training loss combines binary cross entropy and Dice loss:
+The segmentation loss combines binary cross entropy and Dice loss. For the final B5 model, a classification BCE term on per-organ presence labels is added:
 
 ```text
-Loss = BCEWithLogitsLoss + 3 × DiceLoss
+Loss = BCEWithLogitsLoss(seg) + 3 × DiceLoss(seg) + 0.3 × BCEWithLogitsLoss(cls)
 ```
 
-BCEWithLogitsLoss helps the model learn pixel-level foreground/background classification, while Dice loss directly encourages overlap between predicted masks and ground-truth masks.
+BCEWithLogitsLoss helps the model learn pixel-level foreground/background classification, while Dice loss directly encourages overlap between predicted masks and ground-truth masks. The presence targets are derived from the masks (a class is "present" if its mask has any positive pixel). The B0 baseline used only the first two terms.
 
 The Dice loss is configured for multilabel segmentation and uses logits directly:
 
@@ -240,22 +238,27 @@ If both the predicted mask and ground-truth mask are empty for a class, the Dice
 
 ## Training History
 
-The best validation Dice in the recorded fold-0 training run was achieved at epoch 16.
+The B5 model trained the full 20 of 20 epochs. The best validation Dice was reached at the final epoch; the cosine schedule had fully annealed (final lr = `eta_min` 1e-6), and validation Dice over the last ~7 epochs moved only within noise (≤0.0003), so the run has converged.
 
-| Metric | Value |
-|---|---:|
-| Best epoch | 16 |
-| Train loss | 0.3411 |
-| Train Dice | 0.8814 |
-| Validation loss | 0.2874 |
-| Validation Dice | 0.8832 |
-| Large bowel validation Dice | 0.8723 |
-| Small bowel validation Dice | 0.8447 |
-| Stomach validation Dice | 0.9326 |
+| Metric | EfficientNet-B5 (final) | EfficientNet-B0 (baseline) |
+|---|---:|---:|
+| Best epoch | 20 (of 20) | 16 (of 20) |
+| Train loss* | 0.2249 | 0.3411 |
+| Train Dice | 0.9277 | 0.8814 |
+| Validation loss* | 0.2533 | 0.2874 |
+| **Validation Dice** | **0.9112** | 0.8832 |
+| Large bowel validation Dice | 0.9015 | 0.8723 |
+| Small bowel validation Dice | 0.8828 | 0.8447 |
+| Stomach validation Dice | 0.9494 | 0.9326 |
+| Time per epoch | ~42 min | ~12 min |
+
+\* Loss values are not directly comparable: the B5 loss includes the auxiliary classification term.
+
+B5 improves validation Dice over B0 on all three organs, with the largest gain on the hardest class (small bowel). The validation gain carried over to the leaderboard (+0.0067 public / +0.0039 private).
 
 The full per-epoch loss and Dice history is saved as CSV under `results/`
-(`training_history_effnetb0_c_order_fold0.csv` for B0 and
-`training_history_effnetb5_c_order_fold0.csv` for B5).
+(`training_history_effnetb5_c_order_fold0.csv` for B5 and
+`training_history_effnetb0_c_order_fold0.csv` for B0).
 
 ---
 
@@ -266,14 +269,14 @@ After training, a separate validation notebook is used to tune probability thres
 The threshold tuning notebook:
 
 1. Rebuilds the same validation split used during training.
-2. Loads the trained fold-0 checkpoint.
+2. Loads the trained fold-0 checkpoint (for B5, the segmentation logits are taken from the `(seg_logits, cls_logits)` tuple).
 3. Runs inference on the validation set.
 4. Searches candidate thresholds from `0.01` to `0.69` with step size `0.02`.
-5. Selects class-specific thresholds based on validation Dice.
+5. Selects class-specific thresholds based on validation Dice and saves them to `best_thresholds_training_style_c_order_fold0.json`.
 
-The final thresholds used for the submitted model were:
+The final B5 submission uses **per-organ thresholds re-tuned on the B5 checkpoint**, which the submission notebook loads from `thresholds_json_path`. The B0 baseline was submitted with the following thresholds; the submission notebook keeps them only as a fallback (with a warning) when the threshold JSON is absent:
 
-| Class | Threshold |
+| Class | B0 threshold |
 |---|---:|
 | Large bowel | 0.39 |
 | Small bowel | 0.59 |
@@ -285,29 +288,29 @@ The final thresholds used for the submitted model were:
 
 The inference pipeline follows these steps:
 
-1. Load the trained EfficientNet-B0 U-Net checkpoint.
+1. Load the trained EfficientNet-B5 U-Net checkpoint (with the auxiliary head, `use_aux_cls = True`) and the B5 thresholds JSON.
 2. Read test images and construct 2.5D inputs.
 3. Normalize each input slice using percentile normalization.
-4. Resize inputs to `384 × 384`.
-5. Run model inference to obtain logits.
+4. Resize inputs to `456 × 456`.
+5. Run model inference and take `seg_logits` from the `(seg_logits, cls_logits)` output (`forward_seg_logits` helper).
 6. Apply sigmoid activation to convert logits into probabilities.
 7. Apply class-specific thresholds.
 8. Resize predicted masks back to the original image size.
 9. Encode binary masks into RLE format.
 10. Save the final `submission.csv` file.
 
-The submission file contains one row for each image and organ class.
+The submission file contains one row for each image and organ class. The notebook reads the checkpoint and thresholds from Kaggle dataset paths (`checkpoint_path` / `thresholds_json_path`); point these at wherever the artifacts are uploaded.
 
 ---
 
 ## Repository Structure
 
-A typical project structure is:
-
 ```text
 .
 ├── README.md
 ├── CLAUDE.md
+├── LICENSE
+├── .gitignore
 ├── docs/
 │   └── UW_Madison_GI_Tract_Segmentation_Technical_Documentation_EN.docx
 ├── notebooks/
@@ -354,72 +357,9 @@ On Kaggle, internet access may be disabled during submission. In that case, exte
 - 2.5D input improves context by using neighboring MRI slices.
 - GroupKFold prevents patient-case leakage between training and validation.
 - The model uses logits during training and applies sigmoid only for metrics and inference.
-- Threshold tuning is performed after training because the optimal probability threshold may differ across organs.
-- The current implementation trains only fold 0. Training all folds and ensembling their predictions may further improve performance.
-
----
-
-## EfficientNet-B5 Experiment (Submitted — Best Result)
-
-After the EfficientNet-B0 baseline, a higher-capacity variant was trained to push validation Dice
-further. It is now **trained and submitted**, and it is the **best result** so far:
-**public 0.81244 / private 0.77691** (vs B0's 0.80577 / 0.77297).
-
-### Changes vs. the B0 baseline
-
-| Aspect | B0 baseline (submitted) | B5 experiment |
-|---|---|---|
-| Encoder | EfficientNet-B0 | EfficientNet-B5 |
-| Image size | 384 × 384 | 456 × 456 (B5 native) |
-| Batch | 8 | 2 × 4 grad-accum (effective 8) |
-| Aux classification head | none | enabled (per-organ presence logit) |
-| Loss | BCE + 3·Dice | BCE + 3·Dice + 0.3·BCE (presence) |
-
-The auxiliary head shares the encoder and outputs one presence logit per organ
-(`smp.Unet(aux_params=...)`); the model returns `(seg_logits, cls_logits)`. The presence targets
-are derived from the masks (a class is "present" if its mask has any positive pixel), and the
-classification BCE is added with weight `0.3`. Gradient accumulation keeps the per-step memory peak
-small so B5 at 456 fits on a 16 GB GPU while preserving an effective batch size of 8.
-
-### Results
-
-Training ran the **full 20 of 20 epochs** (finished across multiple Kaggle sessions via the
-resume/wall-clock mechanism). The cosine schedule fully annealed to its minimum (final lr =
-`eta_min` 1e-6), so the run has converged — validation Dice over the last ~7 epochs only moved within
-noise (≤0.0003), and the best score landed on the final epoch.
-
-| Metric | B0 baseline | B5 experiment |
-|---|---:|---:|
-| Best epoch | 16 (of 20, finished) | 20 (of 20, finished) |
-| Best validation Dice | 0.8832 | **0.9112** |
-| Large bowel Dice | 0.8723 | 0.9015 |
-| Small bowel Dice | 0.8447 | 0.8828 |
-| Stomach Dice | 0.9326 | 0.9494 |
-| Time per epoch | ~12 min | ~42 min |
-| **Public LB** | 0.80577 | **0.81244** |
-| **Private LB** | 0.77297 | **0.77691** |
-
-The B5 run improves validation Dice by roughly +2.8% over B0 across all three organs, with the
-largest gain on the hardest class (small bowel). The local gain carried over to the leaderboard:
-**+0.0067 public / +0.0039 private**, confirming the validation improvement was real and not
-overfit to fold 0.
-
-The full B5 epoch history is saved to `results/training_history_effnetb5_c_order_fold0.csv`; the
-B0 history (extracted from the original spreadsheet) is at
-`results/training_history_effnetb0_c_order_fold0.csv`.
-
-### How B5 was submitted
-
-The threshold-tuning and submission notebooks were **realigned to the B5 setup**
-(`efficientnet-b5`, `img_size = 456`, `use_aux_cls = True`, and a `forward_seg_logits` helper that
-builds `smp.Unet(aux_params=...)` and takes the segmentation logits from the
-`(seg_logits, cls_logits)` tuple). The threshold-tuning notebook was re-run on the B5 checkpoint to
-produce B5-specific per-class thresholds (the B0 values 0.39 / 0.59 / 0.33 are not optimal for B5),
-which the submission notebook loads via `thresholds_json_path`. This produced the submitted
-**public 0.81244 / private 0.77691** result.
-
-> Reproduction note: both notebooks read the B5 weights and thresholds from Kaggle dataset paths
-> (`checkpoint_path` / `thresholds_json_path`); point these at wherever the artifacts are uploaded.
+- Encoder, `img_size`, and the aux-head flag must match across the training, threshold-tuning, and submission notebooks.
+- Threshold tuning is performed after training because the optimal probability threshold may differ across organs, and it must be re-run whenever the model changes.
+- The current implementation trains only fold 0.
 
 ---
 
@@ -427,9 +367,7 @@ which the submission notebook loads via `thresholds_json_path`. This produced th
 
 Potential improvements include:
 
-- training all 5 folds and using fold ensembling
 - training all 5 folds of the EfficientNet-B5 model and ensembling them (only fold 0 is submitted so far)
-- testing other larger encoders such as EfficientNet-B3
 - using longer 2.5D context windows
 - adding stronger post-processing for removing small false-positive masks
 - tuning thresholds using the final competition-style metric
@@ -440,4 +378,4 @@ Potential improvements include:
 
 ## Summary
 
-This project implements a complete medical image segmentation pipeline for gastrointestinal organ segmentation from abdominal MRI slices. The solution uses a 2.5D EfficientNet U-Net model, C-order RLE mask handling, case-level grouped validation, BCE plus Dice loss, and class-specific threshold tuning. The EfficientNet-B0 baseline scored public `0.80577` / private `0.77297`; the larger EfficientNet-B5 model with an auxiliary classification head improved this to public `0.81244` / private `0.77691`, the best submitted result.
+This project implements a complete medical image segmentation pipeline for gastrointestinal organ segmentation from abdominal MRI slices. The final solution is a 2.5D EfficientNet-B5 U-Net with an auxiliary organ-presence classification head, trained with C-order RLE mask handling, case-level grouped validation, BCE plus Dice loss (plus a presence BCE term), and class-specific threshold tuning. It reaches fold-0 validation Dice `0.9112` and public `0.81244` / private `0.77691`, improving on the EfficientNet-B0 baseline (`0.8832`; public `0.80577` / private `0.77297`).
